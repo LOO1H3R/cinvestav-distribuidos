@@ -1,0 +1,4 @@
+NTR: 3
+TR1: A B C B C D
+TR2: A E F G D
+TR3: A F E G D
