@@ -78,9 +78,15 @@ class NodeDiscoverer:
 
     def _broadcast_loop(self):
         """Envía un mensaje 'HELLO' periódicamente."""
-        message = json.dumps({"type": "HELLO", "ip": self.local_ip}).encode('utf-8')
+        # Pre-calcular mensaje, pero enviar siempre
         while self.running:
             try:
+                # Re-check de IP por si cambia la red
+                current_ip = Utils.get_local_ip()
+                if current_ip != self.local_ip:
+                    self.local_ip = current_ip
+                
+                message = json.dumps({"type": "HELLO", "ip": self.local_ip}).encode('utf-8')
                 self.sock_send.sendto(message, ('<broadcast>', BROADCAST_PORT))
             except Exception as e:
                 print(f"Error broadcasting: {e}")
@@ -195,9 +201,9 @@ class FileTransferHandler:
             else:
                 self.log_callback(f"Error: Hash mismatch en {filename}.")
                 
-            # Limpiar la marca de "recientemente recibido" después de un tiempo pequeño
-            # para permitir futuras modificaciones legítimas locales
-            time.sleep(1) 
+            # Limpiar la marca de "recientemente recibido" después de un tiempo prudente
+            # Suficiente para que Watchdog dispare sus eventos y sean ignorados
+            time.sleep(5) 
             if filename in self.recently_received:
                 self.recently_received.remove(filename)
 
@@ -214,13 +220,16 @@ class FileTransferHandler:
         
         # Evitar enviar lo que acabamos de recibir (Bucle infinito)
         if filename in self.recently_received:
+            print(f"DEBUG: No enviando {filename} porque está en recently_received")
             return
 
         try:
+            print(f"DEBUG: Intentando conectar a {ip} para enviar {filename}")
             file_size = os.path.getsize(filepath)
             file_hash = Utils.calculate_file_hash(filepath)
             
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5.0) # Timeout de conexión
             s.connect((ip, FILE_TRANSFER_PORT))
             
             # Preparar Header
@@ -263,16 +272,47 @@ class WatchdogHandler(FileSystemEventHandler):
 
     def on_modified(self, event):
         if not event.is_directory:
+            # Use threading to not block the observer loop
             threading.Thread(target=self._process_event, args=(event.src_path,)).start()
+
+    def on_moved(self, event):
+        if not event.is_directory:
+             # Algunos editores guardan haciendo rename de un temp file al original
+             # En este caso, nos interesa el destino (dest_path)
+            threading.Thread(target=self._process_event, args=(event.dest_path,)).start()
 
     def _process_event(self, filepath):
         # Pequeña pausa para asegurar que el archivo se terminó de escribir
-        time.sleep(1.0) # Aumentado tiempo para evitar lecturas parciales
+        time.sleep(2.0)
         
+        if not os.path.exists(filepath):
+            return
+
         filename = os.path.basename(filepath)
         
+        # DEBUG: Imprimir para verificar que el evento se está procesando
+        print(f"DEBUG: Procesando evento para {filename}") 
+
         # Verificar si es un archivo que acabamos de recibir
         if filename in self.transfer_handler.recently_received:
+            print(f"DEBUG: Ignorando {filename} por estar en recently_received")
+            return
+
+        # Propagar a todos los peers conocidos
+        peers = list(self.discoverer.peers.keys())
+        if not peers:
+            print("DEBUG: No hay peers para enviar.")
+            return
+
+        # Calcular hash actual para verificar integridad antes de enviar
+        current_hash = Utils.calculate_file_hash(filepath)
+        if not current_hash:
+            return
+
+        for peer_ip in peers:
+            print(f"DEBUG: Iniciando envío de {filename} a {peer_ip}")
+            threading.Thread(target=self.transfer_handler.send_file, 
+                           args=(peer_ip, filepath)).start() # Lanzar envío en hilo aparte para no bloquear siguiente peer
             # print(f"DEBUG: Ignorando evento local de {filename} (recibido recientemente)")
             return
 
