@@ -6,7 +6,7 @@ import sys
 import hashlib
 import json
 import tkinter as tk
-from tkinter import scrolledtext, filedialog, messagebox, simpledialog
+from tkinter import scrolledtext, filedialog, messagebox, simpledialog, ttk
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -17,9 +17,35 @@ BUFFER_SIZE = 4096          # Tamaño del buffer para transferencias
 SHARED_FOLDER = "shared_folder" # Carpeta a monitorear
 PROTECTED_FOLDER = "protected_folder" # Carpeta protegida
 BEACON_INTERVAL = 3         # Segundos entre anuncios de presencia
+CHECKPOINT_FILE = "checkpoints.json" # Archivo para guardar estado de descargas
 
 class Utils:
     """Clase de utilidades estáticas."""
+    
+    @staticmethod
+    def load_checkpoints():
+        if os.path.exists(CHECKPOINT_FILE):
+            try:
+                with open(CHECKPOINT_FILE, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+
+    @staticmethod
+    def save_checkpoint(filename, data):
+        checkpoints = Utils.load_checkpoints()
+        checkpoints[filename] = data
+        with open(CHECKPOINT_FILE, 'w') as f:
+            json.dump(checkpoints, f)
+
+    @staticmethod
+    def remove_checkpoint(filename):
+        checkpoints = Utils.load_checkpoints()
+        if filename in checkpoints:
+            del checkpoints[filename]
+            with open(CHECKPOINT_FILE, 'w') as f:
+                json.dump(checkpoints, f)
     
     @staticmethod
     def get_local_ip():
@@ -77,6 +103,9 @@ class NodeDiscoverer:
         threading.Thread(target=self._broadcast_loop, daemon=True).start()
         threading.Thread(target=self._listen_loop, daemon=True).start()
         threading.Thread(target=self._cleanup_loop, daemon=True).start()
+        
+    def set_request_resume_callback(self, callback):
+        self.request_resume_callback = callback
 
     def _broadcast_loop(self):
         """Envía un mensaje 'HELLO' periódicamente."""
@@ -107,10 +136,25 @@ class NodeDiscoverer:
                     if peer_ip != self.local_ip:
                         self.peers[peer_ip] = time.time()
                         self.callback_update_peers(self.peers.keys())
+                    # Check for pending checkpoint logic
+                    self._check_pending_download(peer_ip)
+
             except socket.timeout:
                 continue
             except Exception as e:
                 print(f"Error listening discovery: {e}")
+
+    def _check_pending_download(self, peer_ip):
+         checkpoints = Utils.load_checkpoints()
+         for filename, info in checkpoints.items():
+            if info["source_ip"] == peer_ip:
+                print(f"DEBUG: Encontrado descarga pendiente de {filename} desde {peer_ip}. Solicitando reanudación.")
+                # We need access to send logic. Let's make this simple:
+                # Need FileTransferHandler reference or a mechanism to trigger Request
+                # For now, let's inject a callback or allow external trigger
+                if hasattr(self, 'request_resume_callback'):
+                    self.request_resume_callback(peer_ip, filename, info["offset"], info["is_protected"], info.get("password"))
+
 
     def _cleanup_loop(self):
         """Elimina pares que no han enviado señales recientemente."""
@@ -129,9 +173,11 @@ class NodeDiscoverer:
 class FileTransferHandler:
     """Maneja el envío y recepción de archivos vía TCP."""
     
-    def __init__(self, log_callback, password):
+    def __init__(self, log_callback, password, progress_callback=None, app=None):
         self.log_callback = log_callback
         self.password = password
+        self.progress_callback = progress_callback
+        self.app = app # Reference to main app for callbacks
         self.running = False
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -170,6 +216,35 @@ class FileTransferHandler:
             header_bytes = conn.recv(header_len)
             header = json.loads(header_bytes.decode('utf-8'))
             
+            # Handle Resume Request
+            if header.get("type") == "RESUME_REQUEST":
+                req_filename = header["filename"]
+                req_offset = header["offset"]
+                req_protected = header["is_protected"]
+                req_pwd = header.get("password")
+                
+                # Security check
+                if req_protected and req_pwd != self.password:
+                    self.log_callback(f"Rechazado Resume: {req_filename} (Password incorrecto)")
+                    conn.close()
+                    return
+
+                # Check file exists locally
+                local_dir = PROTECTED_FOLDER if req_protected else SHARED_FOLDER
+                local_path = os.path.join(local_dir, req_filename)
+                
+                if os.path.exists(local_path):
+                     # Trigger send from offset
+                     peer_ip = conn.getpeername()[0]
+                     conn.close()
+                     # Launch send thread
+                     threading.Thread(target=self.send_file, 
+                                    args=(peer_ip, local_path, req_pwd, req_offset)).start()
+                else:
+                    self.log_callback(f"No se encontró archivo solicitado para resume: {req_filename}")
+                    conn.close()
+                return
+
             filename = header['filename']
             file_hash = header['hash']
             file_size = header['size']
@@ -188,23 +263,75 @@ class FileTransferHandler:
                 filepath = os.path.join(SHARED_FOLDER, filename)
             
             # Verificar si ya tenemos este archivo con el mismo hash para evitar escritura redundante
-            current_hash = Utils.calculate_file_hash(filepath)
-            if current_hash == file_hash:
-                self.log_callback(f"Ignorado: {filename} ya existe y es idéntico.")
-                conn.close()
-                return
+            if not os.path.exists(filepath):
+                 pass # New file
+            else:
+                 # If we have a partial file, does it match what we expect?
+                 # If hashes match, it's done.
+                 # If size matches, it's done.
+                 # If size < file_size, maybe partial.
+                 current_hash = Utils.calculate_file_hash(filepath)
+                 if current_hash == file_hash:
+                     self.log_callback(f"Ignorado: {filename} ya existe y es idéntico.")
+                     conn.close()
+                     # If we had a checkpoint, remove it
+                     Utils.remove_checkpoint(filename)
+                     return
 
+            # Si el archivo existe pero con hash diferente, podría ser una versión vieja o incompleta.
+            # Para simplificar checkpoints, asumiremos que si existe y es menor, es el incompleto que estamos bajando.
+            existing_size = 0
+            if os.path.exists(filepath):
+                 existing_size = os.path.getsize(filepath)
+
+            # Check if this is a RESUME (we requested it, so we expect data from offset)
+            # The sender sends data assuming offset. But wait, in send_file logic, the header has 'size' = original file size.
+            # We are just receiving bytes.
+            
             # Marcar como recibido recientemente para que Watchdog no lo reenvíe
             self.recently_received.add((filename, is_protected))
 
-            # Paso 2: Recibir contenido del archivo
-            received_bytes = 0
-            with open(filepath, 'wb') as f:
+            # Guardar Checkpoint
+            if existing_size > 0 and existing_size < file_size:
+                 mode = 'ab' # Append
+                 received_bytes = existing_size
+            else:
+                 mode = 'wb' # Overwrite
+                 received_bytes = 0
+            
+            # Add/Update Checkpoint info
+            checkpoint_data = {
+                 "source_ip": conn.getpeername()[0],
+                 "file_size": file_size,
+                 "file_hash": file_hash,
+                 "is_protected": is_protected,
+                 "password": password,
+                 "timestamp": time.time(),
+                 "offset": received_bytes 
+            }
+            Utils.save_checkpoint(filename, checkpoint_data)
+
+            with open(filepath, mode) as f:
                 while received_bytes < file_size:
-                    chunk = conn.recv(min(BUFFER_SIZE, file_size - received_bytes))
-                    if not chunk: break
-                    f.write(chunk)
-                    received_bytes += len(chunk)
+                    try:
+                        chunk = conn.recv(min(BUFFER_SIZE, file_size - received_bytes))
+                        if not chunk: raise ConnectionError("Connection lost")
+                        f.write(chunk)
+                        received_bytes += len(chunk)
+                        
+                        # Update Checkpoint periodically?
+                        # Updating every chunk is too heavy for disk IO, but let's do simple updates every 1MB or so
+                        if received_bytes % (1024*1024) == 0:
+                            checkpoint_data["offset"] = received_bytes
+                            # Utils.save_checkpoint(filename, checkpoint_data) # Too slow?
+                    except Exception as e:
+                        self.log_callback(f"Interrupción descarga {filename}: {e}")
+                        checkpoint_data["offset"] = received_bytes
+                        Utils.save_checkpoint(filename, checkpoint_data)
+                        raise # Rethrow to close connection
+            
+            # Download complete
+            Utils.remove_checkpoint(filename)
 
             # Validar integridad
             final_hash = Utils.calculate_file_hash(filepath)
@@ -224,7 +351,7 @@ class FileTransferHandler:
         finally:
             conn.close()
 
-    def send_file(self, ip, filepath, peer_password=None):
+    def send_file(self, ip, filepath, peer_password=None, offset=0):
         """Envía un archivo a una IP específica."""
         if not os.path.exists(filepath): return
         
@@ -236,30 +363,33 @@ class FileTransferHandler:
         is_protected = abs_path.startswith(protected_abs)
 
         # Evitar enviar lo que acabamos de recibir (Bucle infinito)
-        if (filename, is_protected) in self.recently_received:
-            print(f"DEBUG: No enviando {filename} porque está en recently_received")
-            return
+        # Only check if starting from scratch, if resume, we definitely want to send
+        if offset == 0:
+            if (filename, is_protected) in self.recently_received:
+                print(f"DEBUG: No enviando {filename} porque está en recently_received")
+                return
         
         pwd_to_send = self.password
         if is_protected and peer_password:
              pwd_to_send = peer_password
 
         try:
-            print(f"DEBUG: Intentando conectar a {ip} para enviar {filename} (Protegido: {is_protected})")
+            print(f"DEBUG: Intentando conectar a {ip} para enviar {filename} (Protegido: {is_protected}, Offset: {offset})")
             file_size = os.path.getsize(filepath)
             file_hash = Utils.calculate_file_hash(filepath)
             
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5.0) # Timeout de conexión
+            s.settimeout(10.0) # Timeout mas largo
             s.connect((ip, FILE_TRANSFER_PORT))
             
             # Preparar Header
             header = {
                 "filename": filename,
-                "size": file_size,
+                "size": file_size, # Total file size, sender knows total
                 "hash": file_hash,
                 "is_protected": is_protected,
-                "password": pwd_to_send if is_protected else None
+                "password": pwd_to_send if is_protected else None,
+                "offset": offset # Sender says where it starts
             }
             header_bytes = json.dumps(header).encode('utf-8')
             header_len = len(header_bytes).to_bytes(4, 'big')
@@ -269,18 +399,47 @@ class FileTransferHandler:
             s.sendall(header_bytes)
             
             # Enviar Cuerpo
+            sent_bytes = offset
             with open(filepath, 'rb') as f:
+                f.seek(offset)
                 while True:
                     chunk = f.read(BUFFER_SIZE)
                     if not chunk: break
                     s.sendall(chunk)
+                    sent_bytes += len(chunk)
+                    if self.progress_callback and file_size > 0:
+                        self.progress_callback(filename, sent_bytes, file_size)
             
-            self.log_callback(f"Enviado: {filename} a {ip}")
+            self.log_callback(f"Enviado: {filename} a {ip} (Completado)")
             s.close()
         except ConnectionRefusedError:
-            self.log_callback(f"Fallo conexión con {ip}")
+             self.log_callback(f"Fallo conexión con {ip}")
         except Exception as e:
-            self.log_callback(f"Error enviando a {ip}: {e}")
+             self.log_callback(f"Error enviando {filename} a {ip}: {e}")
+
+    def request_resume(self, ip, filename, offset, is_protected, password=None):
+        """Solicita reanudación de descarga a un sender"""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5.0)
+            s.connect((ip, FILE_TRANSFER_PORT))
+            
+            header = {
+                "type": "RESUME_REQUEST",
+                "filename": filename,
+                "offset": offset,
+                "is_protected": is_protected,
+                "password": password
+            }
+            header_bytes = json.dumps(header).encode('utf-8')
+            header_len = len(header_bytes).to_bytes(4, 'big')
+            
+            s.sendall(header_len)
+            s.sendall(header_bytes)
+            s.close()
+            self.log_callback(f"Solicitado RESUME de {filename} a {ip} desde offset {offset}")
+        except Exception as e:
+            self.log_callback(f"Error solicitando resume: {e}")
 
 class WatchdogHandler(FileSystemEventHandler):
     """Manejador de eventos del sistema de archivos."""
@@ -388,6 +547,13 @@ class P2PApp:
         self.btn_set_peer_pwd = tk.Button(root, text="Set Password for Selected Peer", command=self.set_peer_password, state='disabled')
         self.btn_set_peer_pwd.pack(pady=2)
 
+        # Progress bar
+        self.progress_val = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(root, variable=self.progress_val, maximum=100)
+        self.progress_bar.pack(fill=tk.X, padx=10, pady=5)
+        self.lbl_progress = tk.Label(root, text="")
+        self.lbl_progress.pack()
+
         self.log_area = scrolledtext.ScrolledText(root, state='disabled', height=10)
         self.log_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
@@ -397,10 +563,12 @@ class P2PApp:
         self.btn_open_protected.pack(pady=5)
 
         # Lógica de Negocio
-        self.transfer_handler = FileTransferHandler(self.log_message, self.password)
+        self.transfer_handler = FileTransferHandler(self.log_message, self.password, self.update_progress)
         self.transfer_handler.start_server()
         
         self.discoverer = NodeDiscoverer(self.update_peer_list)
+        # Link discoverer with transfer request capability
+        self.discoverer.set_request_resume_callback(self.transfer_handler.request_resume)
         self.discoverer.start()
         
         # Watchdog setup
@@ -414,6 +582,17 @@ class P2PApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         
         self.log_message("Sistema iniciado. Esperando peers...")
+
+    def update_progress(self, filename, sent, total):
+        """Callback para actualizar barra de progreso desde el hilo de envío"""
+        def _update():
+            percent = (sent / total) * 100
+            self.progress_val.set(percent)
+            self.lbl_progress.config(text=f"Enviando {filename}: {int(percent)}%")
+            if sent >= total:
+                self.root.after(2000, lambda: self.lbl_progress.config(text="")) # Limpiar mensaje despues de 2s
+                self.root.after(2000, lambda: self.progress_val.set(0)) # Reset barra
+        self.root.after(0, _update)
 
     def log_message(self, msg):
         """Agrega mensajes al área de texto de manera thread-safe."""
