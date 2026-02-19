@@ -66,9 +66,14 @@ class Utils:
         """Calcula el hash SHA-256 de un archivo para verificar integridad."""
         sha256_hash = hashlib.sha256()
         try:
+            # Buffer size for hashing (64KB is generally more efficient than 4KB)
+            buf_size = 65536
             with open(filepath, "rb") as f:
-                for byte_block in iter(lambda: f.read(4096), b""):
-                    sha256_hash.update(byte_block)
+                while True:
+                    data = f.read(buf_size)
+                    if not data:
+                        break
+                    sha256_hash.update(data)
             return sha256_hash.hexdigest()
         except FileNotFoundError:
             return None
@@ -323,10 +328,20 @@ class FileTransferHandler:
             self.recently_received.add((filename, is_protected))
 
             # Guardar Checkpoint
-            if existing_size > 0 and existing_size < file_size:
+            # Better logic: Only resume if checkpoint exists for this file
+            checkpoints = Utils.load_checkpoints()
+            has_checkpoint = filename in checkpoints
+            
+            mode = 'wb'
+            received_bytes = 0
+            
+            if has_checkpoint and existing_size > 0 and existing_size < file_size:
+                 self.log_callback(f"Reanudando {filename} desde {existing_size} bytes")
                  mode = 'ab' # Append
                  received_bytes = existing_size
             else:
+                 if existing_size > 0:
+                     self.log_callback(f"Iniciando descarga limpia de {filename} (Sobrescribiendo local)")
                  mode = 'wb' # Overwrite
                  received_bytes = 0
             
@@ -444,8 +459,12 @@ class FileTransferHandler:
             sent_bytes = offset
             with open(filepath, 'rb') as f:
                 f.seek(offset)
-                while True:
-                    chunk = f.read(BUFFER_SIZE)
+                while sent_bytes < file_size:
+                    # Read only what is needed to reach file_size
+                    # In case file grew during transfer, we don't want to send extra bytes
+                    # that the receiver isn't expecting.
+                    bytes_to_read = min(BUFFER_SIZE, file_size - sent_bytes)
+                    chunk = f.read(bytes_to_read)
                     if not chunk: break
                     s.sendall(chunk)
                     sent_bytes += len(chunk)
