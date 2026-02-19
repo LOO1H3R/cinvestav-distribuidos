@@ -2,6 +2,7 @@ import socket
 import threading
 import time
 import os
+import sys
 import hashlib
 import json
 import tkinter as tk
@@ -14,6 +15,8 @@ BROADCAST_PORT = 5000       # Puerto para descubrimiento UDP
 FILE_TRANSFER_PORT = 5001   # Puerto TCP para transferencia de archivos
 BUFFER_SIZE = 4096          # Tamaño del buffer para transferencias
 SHARED_FOLDER = "shared_folder" # Carpeta a monitorear
+PROTECTED_FOLDER = "protected_folder" # Carpeta protegida
+PROTECTED_PASSWORD = "secure_password_123" # Contraseña compartida
 BEACON_INTERVAL = 3         # Segundos entre anuncios de presencia
 
 class Utils:
@@ -170,10 +173,19 @@ class FileTransferHandler:
             filename = header['filename']
             file_hash = header['hash']
             file_size = header['size']
-            
-            self.log_callback(f"Recibiendo: {filename} ({file_size} bytes)")
-            
-            filepath = os.path.join(SHARED_FOLDER, filename)
+            is_protected = header.get('is_protected', False)
+            password = header.get('password', None)
+
+            if is_protected:
+                if password != PROTECTED_PASSWORD:
+                    self.log_callback(f"Rechazado: {filename} (Contraseña incorrecta)")
+                    conn.close()
+                    return
+                self.log_callback(f"Recibiendo protegido: {filename} ({file_size} bytes)")
+                filepath = os.path.join(PROTECTED_FOLDER, filename)
+            else:
+                self.log_callback(f"Recibiendo: {filename} ({file_size} bytes)")
+                filepath = os.path.join(SHARED_FOLDER, filename)
             
             # Verificar si ya tenemos este archivo con el mismo hash para evitar escritura redundante
             current_hash = Utils.calculate_file_hash(filepath)
@@ -183,7 +195,7 @@ class FileTransferHandler:
                 return
 
             # Marcar como recibido recientemente para que Watchdog no lo reenvíe
-            self.recently_received.add(filename)
+            self.recently_received.add((filename, is_protected))
 
             # Paso 2: Recibir contenido del archivo
             received_bytes = 0
@@ -204,8 +216,8 @@ class FileTransferHandler:
             # Limpiar la marca de "recientemente recibido" después de un tiempo prudente
             # Suficiente para que Watchdog dispare sus eventos y sean ignorados
             time.sleep(5) 
-            if filename in self.recently_received:
-                self.recently_received.remove(filename)
+            if (filename, is_protected) in self.recently_received:
+                self.recently_received.remove((filename, is_protected))
 
         except Exception as e:
             self.log_callback(f"Error en recepción: {e}")
@@ -218,13 +230,18 @@ class FileTransferHandler:
         
         filename = os.path.basename(filepath)
         
+        # Determine if protected
+        abs_path = os.path.abspath(filepath)
+        protected_abs = os.path.abspath(PROTECTED_FOLDER)
+        is_protected = abs_path.startswith(protected_abs)
+
         # Evitar enviar lo que acabamos de recibir (Bucle infinito)
-        if filename in self.recently_received:
+        if (filename, is_protected) in self.recently_received:
             print(f"DEBUG: No enviando {filename} porque está en recently_received")
             return
 
         try:
-            print(f"DEBUG: Intentando conectar a {ip} para enviar {filename}")
+            print(f"DEBUG: Intentando conectar a {ip} para enviar {filename} (Protegido: {is_protected})")
             file_size = os.path.getsize(filepath)
             file_hash = Utils.calculate_file_hash(filepath)
             
@@ -236,7 +253,9 @@ class FileTransferHandler:
             header = {
                 "filename": filename,
                 "size": file_size,
-                "hash": file_hash
+                "hash": file_hash,
+                "is_protected": is_protected,
+                "password": PROTECTED_PASSWORD if is_protected else None
             }
             header_bytes = json.dumps(header).encode('utf-8')
             header_len = len(header_bytes).to_bytes(4, 'big')
@@ -293,8 +312,13 @@ class WatchdogHandler(FileSystemEventHandler):
         # DEBUG: Imprimir para verificar que el evento se está procesando
         print(f"DEBUG: Procesando evento para {filename}") 
 
+        # Determine if protected
+        abs_path = os.path.abspath(filepath)
+        protected_abs = os.path.abspath(PROTECTED_FOLDER)
+        is_protected = abs_path.startswith(protected_abs)
+
         # Verificar si es un archivo que acabamos de recibir
-        if filename in self.transfer_handler.recently_received:
+        if (filename, is_protected) in self.transfer_handler.recently_received:
             print(f"DEBUG: Ignorando {filename} por estar en recently_received")
             return
 
@@ -336,6 +360,8 @@ class P2PApp:
         # Asegurar directoria
         if not os.path.exists(SHARED_FOLDER):
             os.makedirs(SHARED_FOLDER)
+        if not os.path.exists(PROTECTED_FOLDER):
+            os.makedirs(PROTECTED_FOLDER)
         
         # UI Elements
         self.lbl_local_ip = tk.Label(root, text=f"Mi IP: {Utils.get_local_ip()}", font=("Arial", 12, "bold"))
@@ -351,7 +377,9 @@ class P2PApp:
         self.log_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         self.btn_open_folder = tk.Button(root, text="Abrir Carpeta Compartida", command=self.open_folder)
-        self.btn_open_folder.pack(pady=10)
+        self.btn_open_folder.pack(pady=5)
+        self.btn_open_protected = tk.Button(root, text="Abrir Carpeta Protegida", command=self.open_protected)
+        self.btn_open_protected.pack(pady=5)
 
         # Lógica de Negocio
         self.transfer_handler = FileTransferHandler(self.log_message)
@@ -364,6 +392,7 @@ class P2PApp:
         self.observer = Observer()
         event_handler = WatchdogHandler(self.discoverer, self.transfer_handler)
         self.observer.schedule(event_handler, SHARED_FOLDER, recursive=False)
+        self.observer.schedule(event_handler, PROTECTED_FOLDER, recursive=False)
         self.observer.start()
 
         # Shutdown graceful
@@ -391,16 +420,22 @@ class P2PApp:
 
     def open_folder(self):
         """Abre la carpeta compartida en el explorador de archivos del OS."""
-        import platform
-        import subprocess
-        
-        path = os.path.abspath(SHARED_FOLDER)
-        if platform.system() == "Windows":
+        self._open_folder_path(SHARED_FOLDER)
+
+    def open_protected(self):
+        """Abre la carpeta protegida en el explorador de archivos del OS."""
+        self._open_folder_path(PROTECTED_FOLDER)
+
+    def _open_folder_path(self, folder):
+        path = os.path.abspath(folder)
+        if hasattr(os, 'startfile'):
             os.startfile(path)
-        elif platform.system() == "Darwin":
-            subprocess.Popen(["open", path])
         else:
-            subprocess.Popen(["xdg-open", path])
+            import subprocess
+            if 'darwin' in sys.platform:
+                subprocess.Popen(['open', path])
+            else:
+                subprocess.Popen(['xdg-open', path])
 
     def on_close(self):
         """Cierre limpio de hilos y observadores."""
