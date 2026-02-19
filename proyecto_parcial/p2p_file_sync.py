@@ -518,26 +518,55 @@ class WatchdogHandler(FileSystemEventHandler):
             threading.Thread(target=self._process_event, args=(event.dest_path,)).start()
 
     def _process_event(self, filepath):
+        # Determine filename immediately
+        filename = os.path.basename(filepath)
+
+        # Check immediately if downloading to avoid waiting if not needed
+        # and to catch it early.
+        is_downloading = any(f == filename for f, _ in self.transfer_handler.active_downloads)
+        if is_downloading:
+            print(f"DEBUG: Ignorando evento de {filename} porque se está descargando actualmente (Early check)")
+            return
+
         # Pequeña pausa para asegurar que el archivo se terminó de escribir
         time.sleep(2.0)
         
         if not os.path.exists(filepath):
             return
-
-        filename = os.path.basename(filepath)
+        
+        # Double check after sleep
+        is_downloading = any(f == filename for f, _ in self.transfer_handler.active_downloads)
+        if is_downloading:
+            print(f"DEBUG: Ignorando evento de {filename} porque se está descargando actualmente (Late check)")
+            return
         
         # DEBUG: Imprimir para verificar que el evento se está procesando
         print(f"DEBUG: Procesando evento para {filename}") 
 
         # Determine if protected
         abs_path = os.path.abspath(filepath)
+
         protected_abs = os.path.abspath(PROTECTED_FOLDER)
         is_protected = abs_path.startswith(protected_abs)
 
         # Verificar si es un archivo que acabamos de recibir
+        # Check both False and True just in case logic mismatched slightly, though it shouldn't.
+        # Check filename only
+        is_recent = any(f == filename for f, p in self.transfer_handler.recently_received)
+        if is_recent:
+             print(f"DEBUG: Ignorando {filename} por estar en recently_received (Filename match)")
+             return
+
         if (filename, is_protected) in self.transfer_handler.recently_received:
             print(f"DEBUG: Ignorando {filename} por estar en recently_received")
             return
+
+        # Check if we have an incomplete download checkpoint for this file
+        # This prevents sending incomplete files if a download failed/paused
+        checkpoints = Utils.load_checkpoints()
+        if filename in checkpoints:
+             print(f"DEBUG: Ignorando evento de {filename} porque tiene un checkpoint activo (descarga incompleta)")
+             return
 
         # Obtener peers a los que enviar
         peers = self.get_target_peers()
