@@ -501,31 +501,59 @@ class WatchdogHandler(FileSystemEventHandler):
         self.transfer_handler = transfer_handler
         self.get_target_peers = get_target_peers_callback
         self.get_peer_password = get_peer_password_callback
+        self.last_event_time = {} # Debounce dictionary {filepath: timestamp}
+        self.debounce_lock = threading.Lock()
+
+    def _should_process(self, filepath):
+        filename = os.path.basename(filepath)
+        
+        # 1. Check if downloading (Fast sync check)
+        is_downloading = any(f == filename for f, _ in self.transfer_handler.active_downloads)
+        if is_downloading:
+            return False
+
+        # 2. Check if recently completed
+        is_recent = any(f == filename for f, p in self.transfer_handler.recently_received)
+        if is_recent:
+             return False
+
+        current_time = time.time()
+        with self.debounce_lock:
+            last_time = self.last_event_time.get(filepath, 0)
+            # Debounce window of 3.0 seconds to prevent spamming
+            if current_time - last_time < 3.0:
+                pass # return False - actually let's allow re-check after delay, no wait.
+                # If we return false, we DROP the event.
+                # For a large file copy, this means we only process the FIRST event.
+                # And then 3 seconds later we might process the 1000th event.
+                return False
+            self.last_event_time[filepath] = current_time
+        return True
 
     def on_created(self, event):
         if not event.is_directory:
-            threading.Thread(target=self._process_event, args=(event.src_path,)).start()
+            if self._should_process(event.src_path):
+                threading.Thread(target=self._process_event, args=(event.src_path,), daemon=True).start()
 
     def on_modified(self, event):
         if not event.is_directory:
-            # Use threading to not block the observer loop
-            threading.Thread(target=self._process_event, args=(event.src_path,)).start()
+            if self._should_process(event.src_path):
+                threading.Thread(target=self._process_event, args=(event.src_path,), daemon=True).start()
 
     def on_moved(self, event):
         if not event.is_directory:
-             # Algunos editores guardan haciendo rename de un temp file al original
-             # En este caso, nos interesa el destino (dest_path)
-            threading.Thread(target=self._process_event, args=(event.dest_path,)).start()
+            if self._should_process(event.dest_path):
+                threading.Thread(target=self._process_event, args=(event.dest_path,), daemon=True).start()
 
     def _process_event(self, filepath):
+        # Additional debounce check or wait?
+        # The thread is spawned.
         # Determine filename immediately
         filename = os.path.basename(filepath)
 
-        # Check immediately if downloading to avoid waiting if not needed
-        # and to catch it early.
+        # Check AGAIN if downloading (in case it started while waiting)
         is_downloading = any(f == filename for f, _ in self.transfer_handler.active_downloads)
         if is_downloading:
-            print(f"DEBUG: Ignorando evento de {filename} porque se está descargando actualmente (Early check)")
             return
 
         # Pequeña pausa para asegurar que el archivo se terminó de escribir
