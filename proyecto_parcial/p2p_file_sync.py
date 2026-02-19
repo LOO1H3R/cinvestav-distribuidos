@@ -187,6 +187,7 @@ class FileTransferHandler:
         
         # Evitar re-procesar archivos que acabamos de recibir
         self.recently_received = set() 
+        self.active_downloads = set() # Track active downloads (filename, peer_ip) 
 
     def start_server(self):
         self.running = True
@@ -250,10 +251,20 @@ class FileTransferHandler:
             file_size = header['size']
             is_protected = header.get('is_protected', False)
             password = header.get('password', None)
+            
+            # Avoid duplicate downloads
+            peer_ip = conn.getpeername()[0]
+            if (filename, peer_ip) in self.active_downloads:
+                self.log_callback(f"Ignorado: {filename} ya se esta descargando de {peer_ip}.")
+                conn.close()
+                return
+            
+            self.active_downloads.add((filename, peer_ip))
 
             if is_protected:
                 if password != self.password:
                     self.log_callback(f"Rechazado: {filename} (Contraseña incorrecta)")
+                    self.active_downloads.remove((filename, peer_ip))
                     conn.close()
                     return
                 self.log_callback(f"Recibiendo protegido: {filename} ({file_size} bytes)")
@@ -273,6 +284,7 @@ class FileTransferHandler:
                  current_hash = Utils.calculate_file_hash(filepath)
                  if current_hash == file_hash:
                      self.log_callback(f"Ignorado: {filename} ya existe y es idéntico.")
+                     self.active_downloads.remove((filename, peer_ip))
                      conn.close()
                      # If we had a checkpoint, remove it
                      Utils.remove_checkpoint(filename)
@@ -349,7 +361,13 @@ class FileTransferHandler:
         except Exception as e:
             self.log_callback(f"Error en recepción: {e}")
         finally:
+            if 'filename' in locals() and 'peer_ip' in locals():
+               if (filename, peer_ip) in self.active_downloads:
+                   self.active_downloads.remove((filename, peer_ip))
             conn.close()
+
+    def is_downloading(self, filename, peer_ip):
+         return (filename, peer_ip) in self.active_downloads
 
     def send_file(self, ip, filepath, peer_password=None, offset=0):
         """Envía un archivo a una IP específica."""
@@ -419,6 +437,10 @@ class FileTransferHandler:
 
     def request_resume(self, ip, filename, offset, is_protected, password=None):
         """Solicita reanudación de descarga a un sender"""
+        if self.is_downloading(filename, ip):
+             # Already downloading
+             return
+
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(5.0)
