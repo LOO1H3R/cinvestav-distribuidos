@@ -106,6 +106,9 @@ class NodeDiscoverer:
         
     def set_request_resume_callback(self, callback):
         self.request_resume_callback = callback
+    
+    def set_is_downloading_callback(self, callback):
+        self.is_downloading_callback = callback
 
     def _broadcast_loop(self):
         """Envía un mensaje 'HELLO' periódicamente."""
@@ -148,11 +151,16 @@ class NodeDiscoverer:
          checkpoints = Utils.load_checkpoints()
          for filename, info in checkpoints.items():
             if info["source_ip"] == peer_ip:
+                # Check if already downloading via callback
+                if hasattr(self, 'is_downloading_callback') and self.is_downloading_callback:
+                    if self.is_downloading_callback(filename, peer_ip):
+                        continue
+
                 print(f"DEBUG: Encontrado descarga pendiente de {filename} desde {peer_ip}. Solicitando reanudación.")
                 # We need access to send logic. Let's make this simple:
                 # Need FileTransferHandler reference or a mechanism to trigger Request
                 # For now, let's inject a callback or allow external trigger
-                if hasattr(self, 'request_resume_callback'):
+                if hasattr(self, 'request_resume_callback') and self.request_resume_callback:
                     self.request_resume_callback(peer_ip, filename, info["offset"], info["is_protected"], info.get("password"))
 
 
@@ -254,17 +262,27 @@ class FileTransferHandler:
             
             # Avoid duplicate downloads
             peer_ip = conn.getpeername()[0]
-            if (filename, peer_ip) in self.active_downloads:
-                self.log_callback(f"Ignorado: {filename} ya se esta descargando de {peer_ip}.")
-                conn.close()
-                return
-            
-            self.active_downloads.add((filename, peer_ip))
+            # Since request_resume adds to active_downloads to prevent new requests,
+            # we simply allow the connection if it's there.
+            # We add it if it's not.
+            if (filename, peer_ip) not in self.active_downloads:
+                self.active_downloads.add((filename, peer_ip))
+
+            # Update state to DOWNLOADING
+            if (filename, peer_ip) not in self.active_downloads:
+                 # Standard push or first encounter
+                 self.active_downloads.add((filename, peer_ip))
+            else:
+                 # It was requested (is in list). We allow it to proceed.
+                 # But we must be careful not to allow a second connection for the SAME request.
+                 # This simple set logic doesn't prevent race if 2 connections arrive simultaneously.
+                 pass
 
             if is_protected:
                 if password != self.password:
                     self.log_callback(f"Rechazado: {filename} (Contraseña incorrecta)")
-                    self.active_downloads.remove((filename, peer_ip))
+                    if (filename, peer_ip) in self.active_downloads:
+                        self.active_downloads.remove((filename, peer_ip))
                     conn.close()
                     return
                 self.log_callback(f"Recibiendo protegido: {filename} ({file_size} bytes)")
@@ -284,7 +302,8 @@ class FileTransferHandler:
                  current_hash = Utils.calculate_file_hash(filepath)
                  if current_hash == file_hash:
                      self.log_callback(f"Ignorado: {filename} ya existe y es idéntico.")
-                     self.active_downloads.remove((filename, peer_ip))
+                     if (filename, peer_ip) in self.active_downloads:
+                         self.active_downloads.remove((filename, peer_ip))
                      conn.close()
                      # If we had a checkpoint, remove it
                      Utils.remove_checkpoint(filename)
@@ -356,14 +375,19 @@ class FileTransferHandler:
             # Suficiente para que Watchdog dispare sus eventos y sean ignorados
             time.sleep(5) 
             if (filename, is_protected) in self.recently_received:
-                self.recently_received.remove((filename, is_protected))
+                 self.recently_received.remove((filename, is_protected))
+            
+            if (filename, peer_ip) in self.active_downloads:
+                 self.active_downloads.remove((filename, peer_ip))
+            
+            # Limpiar la marca de "recientemente recibido" después de un tiempo prudente
 
         except Exception as e:
             self.log_callback(f"Error en recepción: {e}")
-        finally:
             if 'filename' in locals() and 'peer_ip' in locals():
                if (filename, peer_ip) in self.active_downloads:
                    self.active_downloads.remove((filename, peer_ip))
+        finally:
             conn.close()
 
     def is_downloading(self, filename, peer_ip):
@@ -438,9 +462,12 @@ class FileTransferHandler:
     def request_resume(self, ip, filename, offset, is_protected, password=None):
         """Solicita reanudación de descarga a un sender"""
         if self.is_downloading(filename, ip):
-             # Already downloading
+             # Already downloading or requested
              return
 
+        # Mark as downloading immediately to prevent duplicate requests
+        self.active_downloads.add((filename, ip))
+        
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(5.0)
@@ -462,6 +489,9 @@ class FileTransferHandler:
             self.log_callback(f"Solicitado RESUME de {filename} a {ip} desde offset {offset}")
         except Exception as e:
             self.log_callback(f"Error solicitando resume: {e}")
+            # If request failed, remove from active so we can try again
+            if (filename, ip) in self.active_downloads:
+                self.active_downloads.remove((filename, ip))
 
 class WatchdogHandler(FileSystemEventHandler):
     """Manejador de eventos del sistema de archivos."""
@@ -591,6 +621,7 @@ class P2PApp:
         self.discoverer = NodeDiscoverer(self.update_peer_list)
         # Link discoverer with transfer request capability
         self.discoverer.set_request_resume_callback(self.transfer_handler.request_resume)
+        self.discoverer.set_is_downloading_callback(self.transfer_handler.is_downloading)
         self.discoverer.start()
         
         # Watchdog setup
