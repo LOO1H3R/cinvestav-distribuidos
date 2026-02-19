@@ -6,7 +6,7 @@ import sys
 import hashlib
 import json
 import tkinter as tk
-from tkinter import scrolledtext, filedialog, messagebox
+from tkinter import scrolledtext, filedialog, messagebox, simpledialog
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -16,7 +16,6 @@ FILE_TRANSFER_PORT = 5001   # Puerto TCP para transferencia de archivos
 BUFFER_SIZE = 4096          # Tamaño del buffer para transferencias
 SHARED_FOLDER = "shared_folder" # Carpeta a monitorear
 PROTECTED_FOLDER = "protected_folder" # Carpeta protegida
-PROTECTED_PASSWORD = "secure_password_123" # Contraseña compartida
 BEACON_INTERVAL = 3         # Segundos entre anuncios de presencia
 
 class Utils:
@@ -130,8 +129,9 @@ class NodeDiscoverer:
 class FileTransferHandler:
     """Maneja el envío y recepción de archivos vía TCP."""
     
-    def __init__(self, log_callback):
+    def __init__(self, log_callback, password):
         self.log_callback = log_callback
+        self.password = password
         self.running = False
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -177,7 +177,7 @@ class FileTransferHandler:
             password = header.get('password', None)
 
             if is_protected:
-                if password != PROTECTED_PASSWORD:
+                if password != self.password:
                     self.log_callback(f"Rechazado: {filename} (Contraseña incorrecta)")
                     conn.close()
                     return
@@ -224,7 +224,7 @@ class FileTransferHandler:
         finally:
             conn.close()
 
-    def send_file(self, ip, filepath):
+    def send_file(self, ip, filepath, peer_password=None):
         """Envía un archivo a una IP específica."""
         if not os.path.exists(filepath): return
         
@@ -239,6 +239,10 @@ class FileTransferHandler:
         if (filename, is_protected) in self.recently_received:
             print(f"DEBUG: No enviando {filename} porque está en recently_received")
             return
+        
+        pwd_to_send = self.password
+        if is_protected and peer_password:
+             pwd_to_send = peer_password
 
         try:
             print(f"DEBUG: Intentando conectar a {ip} para enviar {filename} (Protegido: {is_protected})")
@@ -255,7 +259,7 @@ class FileTransferHandler:
                 "size": file_size,
                 "hash": file_hash,
                 "is_protected": is_protected,
-                "password": PROTECTED_PASSWORD if is_protected else None
+                "password": pwd_to_send if is_protected else None
             }
             header_bytes = json.dumps(header).encode('utf-8')
             header_len = len(header_bytes).to_bytes(4, 'big')
@@ -281,9 +285,11 @@ class FileTransferHandler:
 class WatchdogHandler(FileSystemEventHandler):
     """Manejador de eventos del sistema de archivos."""
     
-    def __init__(self, discoverer, transfer_handler):
+    def __init__(self, discoverer, transfer_handler, get_target_peers_callback, get_peer_password_callback):
         self.discoverer = discoverer
         self.transfer_handler = transfer_handler
+        self.get_target_peers = get_target_peers_callback
+        self.get_peer_password = get_peer_password_callback
 
     def on_created(self, event):
         if not event.is_directory:
@@ -322,10 +328,10 @@ class WatchdogHandler(FileSystemEventHandler):
             print(f"DEBUG: Ignorando {filename} por estar en recently_received")
             return
 
-        # Propagar a todos los peers conocidos
-        peers = list(self.discoverer.peers.keys())
+        # Obtener peers a los que enviar
+        peers = self.get_target_peers()
         if not peers:
-            print("DEBUG: No hay peers para enviar.")
+            print("DEBUG: No hay peers seleccionados o disponibles para enviar.")
             return
 
         # Calcular hash actual para verificar integridad antes de enviar
@@ -334,26 +340,29 @@ class WatchdogHandler(FileSystemEventHandler):
             return
 
         for peer_ip in peers:
+            # Obtener contraseña específica del peer si existe
+            peer_specific_password = self.get_peer_password(peer_ip)
+            
             print(f"DEBUG: Iniciando envío de {filename} a {peer_ip}")
             threading.Thread(target=self.transfer_handler.send_file, 
-                           args=(peer_ip, filepath)).start() # Lanzar envío en hilo aparte para no bloquear siguiente peer
-            # print(f"DEBUG: Ignorando evento local de {filename} (recibido recientemente)")
-            return
+                           args=(peer_ip, filepath, peer_specific_password)).start()
 
-        # Propagar a todos los peers conocidos
-        peers = list(self.discoverer.peers.keys())
-        if not peers:
-            return
-            
-        for peer_ip in peers:
-            # No enviamos directamente aqui, llamamos a transfer_handler que chequea hashes y recently_received de nuevo
-            self.transfer_handler.send_file(peer_ip, filepath)
 
 class P2PApp:
     """Clase principal de la interfaz gráfica y orquestación."""
     
     def __init__(self, root):
         self.root = root
+        self.root.withdraw() # Ocultar ventana principal momentáneamente
+        
+        # Pedir contraseña al inicio
+        self.password = simpledialog.askstring("Seguridad", "Ingrese la contraseña para carpetas protegidas:", show='*')
+        if not self.password:
+            self.password = "secret" # Default fallback o salir? Mejor default por si cancelan
+            # O podríamos cerrar la app:
+            # sys.exit(0) 
+        
+        self.root.deiconify() # Mostrar ventana
         self.root.title("P2P LAN File Replicator")
         self.root.geometry("600x400")
 
@@ -367,12 +376,18 @@ class P2PApp:
         self.lbl_local_ip = tk.Label(root, text=f"Mi IP: {Utils.get_local_ip()}", font=("Arial", 12, "bold"))
         self.lbl_local_ip.pack(pady=5)
         
-        self.lbl_peers = tk.Label(root, text="Peers Activos: 0")
+        self.lbl_peers = tk.Label(root, text="Peers Activos: 0 (Seleccione uno para enviar solo a ese)")
         self.lbl_peers.pack()
         
-        self.list_peers = tk.Listbox(root, height=5)
+        self.peer_passwords = {} # {ip: password}
+        self.selected_peer_ip = None
+        self.list_peers = tk.Listbox(root, height=5, selectmode=tk.SINGLE)
         self.list_peers.pack(fill=tk.X, padx=10, pady=5)
+        self.list_peers.bind('<<ListboxSelect>>', self.on_peer_select)
         
+        self.btn_set_peer_pwd = tk.Button(root, text="Set Password for Selected Peer", command=self.set_peer_password, state='disabled')
+        self.btn_set_peer_pwd.pack(pady=2)
+
         self.log_area = scrolledtext.ScrolledText(root, state='disabled', height=10)
         self.log_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
@@ -382,7 +397,7 @@ class P2PApp:
         self.btn_open_protected.pack(pady=5)
 
         # Lógica de Negocio
-        self.transfer_handler = FileTransferHandler(self.log_message)
+        self.transfer_handler = FileTransferHandler(self.log_message, self.password)
         self.transfer_handler.start_server()
         
         self.discoverer = NodeDiscoverer(self.update_peer_list)
@@ -390,7 +405,7 @@ class P2PApp:
         
         # Watchdog setup
         self.observer = Observer()
-        event_handler = WatchdogHandler(self.discoverer, self.transfer_handler)
+        event_handler = WatchdogHandler(self.discoverer, self.transfer_handler, self.get_target_peers, self.get_peer_password_safe)
         self.observer.schedule(event_handler, SHARED_FOLDER, recursive=False)
         self.observer.schedule(event_handler, PROTECTED_FOLDER, recursive=False)
         self.observer.start()
@@ -409,13 +424,91 @@ class P2PApp:
             self.log_area.config(state='disabled')
         self.root.after(0, _log)
 
+    def set_peer_password(self):
+        selection = self.list_peers.curselection()
+        if not selection:
+            # Try to use stored selection
+             if not self.selected_peer_ip:
+                messagebox.showwarning("Error", "Seleccione un peer primero")
+                return
+        else:
+             index = selection[0]
+             self.selected_peer_ip = self.list_peers.get(index)
+        
+        pwd = simpledialog.askstring("Peer Password", f"Password para {self.selected_peer_ip}:", show='*')
+        if pwd is not None:
+             self.peer_passwords[self.selected_peer_ip] = pwd
+             self.log_message(f"Password almacenado para enviar a {self.selected_peer_ip}")
+
+    def get_peer_password_safe(self, ip):
+        """Thread-safe getter para passwords de peers"""
+        return self.peer_passwords.get(ip)
+
+    def on_peer_select(self, event):
+        selection = self.list_peers.curselection()
+        if selection:
+            index = selection[0]
+            self.selected_peer_ip = self.list_peers.get(index)
+            # Update label text safely
+            self.lbl_peers.config(text=f"Peers Activos: {self.list_peers.size()} (Enviando a: {self.selected_peer_ip})")
+            self.btn_set_peer_pwd.config(state='normal')
+        else:
+            self.selected_peer_ip = None
+            self.lbl_peers.config(text=f"Peers Activos: {self.list_peers.size()} (Broadcast a todos)")
+            self.btn_set_peer_pwd.config(state='disabled')
+
+    def get_target_peers(self):
+        """Retorna la lista de peers destinatarios (seleccionado o todos)."""
+        # Snapshot thread-safe de la selección
+        target = self.selected_peer_ip
+        
+        # Validar contra lista actual de peers
+        current_peers = list(self.discoverer.peers.keys())
+        
+        if target:
+            if target in current_peers:
+                 return [target]
+            else:
+                # El peer seleccionado se desconectó
+                # No enviamos a nadie o fallback a broadcast?
+                # Fallback a broadcast es más robusto para reconexiones rápidas, pero confuso.
+                # Mejor no enviar si el usuario quería específico y se fue.
+                print(f"DEBUG: Peer seleccionado {target} no disponible.")
+                return [] 
+        
+        return current_peers
+
     def update_peer_list(self, peers):
-        """Actualiza la lista visual de peers."""
+        """Actualiza la lista visual de peers, preservando selección."""
         def _update():
+            # Intentar mantener la selección visual
+            current_selection = self.selected_peer_ip
+            
             self.list_peers.delete(0, tk.END)
-            for p in peers:
+            # Find selection index
+            sel_idx = -1
+            
+            for i, p in enumerate(peers):
                 self.list_peers.insert(tk.END, p)
-            self.lbl_peers.config(text=f"Peers Activos: {len(peers)}")
+                if p == current_selection:
+                    sel_idx = i
+            
+            if sel_idx >= 0:
+                self.list_peers.selection_set(sel_idx) # selection_set no dispara <<ListboxSelect>>
+            elif current_selection:
+                # Se perdió la selección porque el peer se fue
+                self.selected_peer_ip = None
+            
+            target = self.selected_peer_ip
+            suffix = f" (Enviando a: {target})" if target else " (Broadcast a todos)"
+            self.lbl_peers.config(text=f"Peers Activos: {len(peers)}{suffix}")
+            
+            # Update button state
+            if target:
+                 self.btn_set_peer_pwd.config(state='normal')
+            else:
+                 self.btn_set_peer_pwd.config(state='disabled')
+            
         self.root.after(0, _update)
 
     def open_folder(self):
