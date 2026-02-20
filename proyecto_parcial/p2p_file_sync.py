@@ -383,7 +383,8 @@ class FileTransferHandler:
             if final_hash == file_hash:
                 self.log_callback(f"Éxito: {filename} recibido correctamente.")
             else:
-                self.log_callback(f"Error: Hash mismatch en {filename}.")
+                final_size = os.path.getsize(filepath)
+                self.log_callback(f"Error: Hash mismatch en {filename}. Esperado: {file_hash}, Calculado: {final_hash}. Tamaño esperado: {file_size}, Tamaño final: {final_size}")
                 
             # Limpiar la marca de "recientemente recibido" después de un tiempo prudente
             # Suficiente para que Watchdog dispare sus eventos y sean ignorados
