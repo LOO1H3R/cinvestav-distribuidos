@@ -1,0 +1,87 @@
+PROYECTO: SINCRONIZADOR DE ARCHIVOS P2P EN LAN
+==============================================
+
+1. DESCRIPCIÓN GENERAL
+----------------------
+Este proyecto implementa una aplicación de escritorio en Python para la sincronización automática de archivos entre múltiples computadoras conectadas a una misma red de área local (LAN). La arquitectura es completamente Peer-to-Peer (P2P), lo que significa que no requiere un servidor central dedicado; cada instancia de la aplicación actúa simultáneamente como cliente y servidor para compartir información con los demás nodos.
+
+El objetivo principal es mantener sincronizadas dos carpetas específicas (`shared_folder` y `protected_folder`) en todos los dispositivos activos. Cuando un usuario añade o modifica un archivo en estas carpetas, el cambio se propaga automáticamente a los demás usuarios conectados.
+
+2. CARACTERÍSTICAS PRINCIPALES
+------------------------------
+*   **Arquitectura Descentralizada:** No depende de internet ni de servidores externos. Funciona exclusivamente en la red local.
+*   **Descubrimiento Automático:** Los nodos se encuentran entre sí automáticamente sin necesidad de configurar direcciones IP manualmente.
+*   **Sincronización en Tiempo Real:** Detecta cambios en el sistema de archivos al instante y comienza la transferencia.
+*   **Seguridad Básica:**
+    *   Soporte para una carpeta "protegida" que requiere contraseña para sincronizarse.
+    *   Verificación de integridad de archivos mediante Hash SHA-256 (asegura que el archivo no se corrompió en el camino).
+*   **Resiliencia:**
+    *   Capacidad de "Reanudar" (Resume) descargas interrumpidas. Si se corta la conexión, la próxima vez que los nodos se vean, intentarán completar la descarga desde donde se quedó.
+    *   Evita descargas redundantes si el archivo ya existe y es idéntico.
+
+3. ARQUITECTURA TÉCNICA Y MÓDULOS
+---------------------------------
+El código (`p2p_file_sync.py`) está estructurado en varias clases que manejan responsabilidades específicas:
+
+A. NodeDiscoverer (Descubrimiento de Nodos)
+   - **Función:** Maneja la lógica para encontrar otros dispositivos en la red.
+   - **Protocolo:** Utiliza sockets UDP en el puerto 5000.
+   - **Funcionamiento:**
+     - Envía periódicamente (cada 3 segundos) un mensaje "HELLO" a la dirección de broadcast `255.255.255.255`.
+     - Escucha mensajes "HELLO" de otros. Cuando recibe uno, registra la IP y la hora.
+     - Si un nodo deja de enviar señales por más de 10 segundos, se considera desconectado y se elimina de la lista.
+
+B. FileTransferHandler (Gestor de Transferencias)
+   - **Función:** Se encarga de enviar y recibir los archivos de manera fiable.
+   - **Protocolo:** Utiliza sockets TCP en el puerto 5001.
+   - **Mecanismo de Envío:**
+     1. Se conecta al receptor.
+     2. Envía un encabezado JSON (con longitud prefijada de 4 bytes) que contiene: nombre, tamaño total, hash, si es protegido, y offset (punto de inicio).
+     3. Envía el contenido del archivo crudo.
+   - **Mecanismo de Recepción:**
+     1. Escucha conexiones entrantes.
+     2. Lee el encabezado y decide si aceptar el archivo (verifica contraseñas si es protegido).
+     3. Si el archivo ya existe parcialmente (descarga interrumpida), acepta el "resume" y escribe en modo 'append' (agregar al final).
+     4. Al finalizar, calcula el SHA-256 del archivo recibido y lo compara con el del encabezado para validar integridad.
+
+C. WatchdogHandler (Monitor de Archivos)
+   - **Función:** Detecta cambios en las carpetas locales.
+   - **Librería:** Utiliza `watchdog`.
+   - **Eventos:** Escucha eventos de creación (`on_created`), modificación (`on_modified`) y movimiento (`on_moved`) de archivos.
+   - **Lógica de Filtrado:** Implementa un mecanismo de "debounce" (espera) para evitar enviar el mismo archivo múltiples veces si se guarda muy rápido. También evita "bucles infinitos" ignorando archivos que acaban de ser descargados por la propia aplicación.
+
+D. P2PApp (Interfaz Gráfica)
+   - **Función:** Provee la interfaz de usuario (GUI) utilizando `tkinter`.
+   - **Componentes:**
+     - Lista de Peers: Muestra las IPs de otros usuarios conectados.
+     - Barra de Progreso: Visualiza el estado de las transferencias.
+     - Log de Eventos: Muestra en texto qué está haciendo la aplicación (conectando, enviando, error, etc.).
+     - Configuración de Seguridad: Permite ingresar la contraseña global y contraseñas específicas para enviar a ciertos peers.
+
+E. Utils (Utilidades)
+   - Funciones auxiliares para obtener la IP local, calcular Hashes SHA-256 de archivos y gestionar el archivo de "checkpoints" (`checkpoints.json`) que guarda el estado de las descargas incompletas.
+
+4. FLUJO DE TRABAJO (EJEMPLO)
+-----------------------------
+1.  **Inicio:** El Usuario A abre la app. Se le pide una contraseña para sus carpetas protegidas.
+2.  **Conexión:** La app empieza a anunciar su presencia. El Usuario B abre la app en otra PC. Ambas aparecen en la lista de peers de la otra.
+3.  **Compartir:** El Usuario A copia una foto `vacaciones.jpg` a su carpeta `shared_folder`.
+4.  **Detección:** El `WatchdogHandler` de A detecta el nuevo archivo.
+5.  **Envío:** El sistema contacta a B (IP del peer detectado).
+6.  **Transferencia:** A envía el archivo a B por TCP.
+7.  **Recepción:** B recibe el archivo, verifica que el Hash coincida, y lo guarda en su propia `shared_folder`.
+8.  **Final:** Ambos usuarios tienen el mismo archivo.
+
+5. REQUISITOS DE SISTEMA
+------------------------
+-   Python 3.x instalado.
+-   Librerías externas: `watchdog`. (Instalar con `pip install watchdog`).
+-   Sistema Operativo: Compatible con Windows, Linux y macOS (aunque el método de abrir carpetas varía ligeramente).
+-   Red: Los puertos UDP 5000 y TCP 5001 deben estar permitidos en el firewall.
+
+6. ESTRUCTURA DE CARPETAS
+-------------------------
+Al ejecutar el script, se crearán/usarán las siguientes carpetas en el mismo directorio:
+-   `/shared_folder`: Archivos públicos que se envían a todos los peers.
+-   `/protected_folder`: Archivos que solo se pueden recibir si la contraseña coincide.
+-   `checkpoints.json`: Archivo interno para control de descargas interrumpidas (se borra automáticamente al completar).

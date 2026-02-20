@@ -2,6 +2,7 @@ import socket
 import threading
 import time
 import os
+import shutil
 import sys
 import hashlib
 import json
@@ -66,7 +67,6 @@ class Utils:
         """Calcula el hash SHA-256 de un archivo para verificar integridad."""
         sha256_hash = hashlib.sha256()
         try:
-            # Buffer size for hashing (64KB is generally more efficient than 4KB)
             buf_size = 65536
             with open(filepath, "rb") as f:
                 while True:
@@ -117,7 +117,6 @@ class NodeDiscoverer:
 
     def _broadcast_loop(self):
         """Envía un mensaje 'HELLO' periódicamente."""
-        # Pre-calcular mensaje, pero enviar siempre
         while self.running:
             try:
                 # Re-check de IP por si cambia la red
@@ -690,6 +689,9 @@ class P2PApp:
         self.btn_open_protected = tk.Button(root, text="Abrir Carpeta Protegida", command=self.open_protected)
         self.btn_open_protected.pack(pady=5)
 
+        self.btn_share_file = tk.Button(root, text="Seleccionar Archivo para Compartir", command=self.share_file_manual)
+        self.btn_share_file.pack(pady=5)
+
         # Lógica de Negocio
         self.transfer_handler = FileTransferHandler(self.log_message, self.password, self.update_progress)
         self.transfer_handler.start_server()
@@ -826,6 +828,31 @@ class P2PApp:
     def open_protected(self):
         """Abre la carpeta protegida en el explorador de archivos del OS."""
         self._open_folder_path(PROTECTED_FOLDER)
+
+    def share_file_manual(self):
+        """Permite seleccionar un archivo desde el explorador y copiarlo a la carpeta compartida."""
+        filepath = filedialog.askopenfilename(title="Seleccionar archivo para compartir")
+        if not filepath:
+            return
+
+        filename = os.path.basename(filepath)
+        
+        # Preguntar si es protegido o público
+        is_protected = messagebox.askyesno("Tipo de envío", "¿Desea enviar como archivo protegido?\n(Requiere contraseña)")
+        
+        target_folder = PROTECTED_FOLDER if is_protected else SHARED_FOLDER
+        dest_path = os.path.join(target_folder, filename)
+
+        if os.path.abspath(filepath) == os.path.abspath(dest_path):
+            messagebox.showinfo("Info", "El archivo ya está en la carpeta de destino.")
+            return
+
+        try:
+            shutil.copy2(filepath, dest_path)
+            self.log_message(f"Archivo copiado a {target_folder}: {filename}")
+            # El Watchdog detectará el archivo y lo enviará automáticamente
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo copiar el archivo: {e}")
 
     def _open_folder_path(self, folder):
         path = os.path.abspath(folder)
