@@ -261,6 +261,7 @@ class FileTransferHandler:
             filename = header['filename']
             file_hash = header['hash']
             file_size = header['size']
+            sender_offset = header.get('offset', 0)
             is_protected = header.get('is_protected', False)
             password = header.get('password', None)
             
@@ -289,10 +290,10 @@ class FileTransferHandler:
                         self.active_downloads.remove((filename, peer_ip))
                     conn.close()
                     return
-                self.log_callback(f"Recibiendo protegido: {filename} ({file_size} bytes)")
+                self.log_callback(f"Recibiendo protegido: {filename} ({file_size} bytes) Offset: {sender_offset}")
                 filepath = os.path.join(PROTECTED_FOLDER, filename)
             else:
-                self.log_callback(f"Recibiendo: {filename} ({file_size} bytes)")
+                self.log_callback(f"Recibiendo: {filename} ({file_size} bytes) Offset: {sender_offset}")
                 filepath = os.path.join(SHARED_FOLDER, filename)
             
             # Verificar si ya tenemos este archivo con el mismo hash para evitar escritura redundante
@@ -326,6 +327,8 @@ class FileTransferHandler:
             # Marcar como recibido recientemente para que Watchdog no lo reenvíe
             self.recently_received.add((filename, is_protected))
 
+            sender_offset = header.get('offset', 0)
+            
             # Guardar Checkpoint
             # Better logic: Only resume if checkpoint exists for this file
             checkpoints = Utils.load_checkpoints()
@@ -334,13 +337,39 @@ class FileTransferHandler:
             mode = 'wb'
             received_bytes = 0
             
-            if has_checkpoint and existing_size > 0 and existing_size < file_size:
-                 self.log_callback(f"Reanudando {filename} desde {existing_size} bytes")
-                 mode = 'ab' # Append
-                 received_bytes = existing_size
+            if sender_offset > 0:
+                 if os.path.exists(filepath):
+                     existing_size = os.path.getsize(filepath)
+                     # Si el offset del sender coincide con lo que tenemos, es un resume perfecto
+                     if existing_size == sender_offset:
+                         self.log_callback(f"Reanudando {filename} desde {existing_size} bytes (Coincide offset)")
+                         mode = 'ab' 
+                         received_bytes = existing_size
+                     elif existing_size > sender_offset:
+                         # Tenemos más de lo que nos envían, sobrescribimos la parte extra/mala
+                         self.log_callback(f"Reanudando {filename} corregido: Sender Offset {sender_offset} < Local {existing_size}. Truncando/Sobrescribiendo.")
+                         # Abrimos para lectura/escritura sin borrar, movemos puntero y cortamos
+                         # Pero 'ab' solo escribe al final. 'wb' borra todo. 'r+b' requiere que exista.
+                         with open(filepath, 'r+b') as f:
+                             f.seek(sender_offset)
+                             f.truncate()
+                         mode = 'ab' # Ahora podemos hacer append seguro
+                         received_bytes = sender_offset
+                     else:
+                         # existing_size < sender_offset. Nos falta un hueco.
+                         self.log_callback(f"Error crítico: Sender envía desde {sender_offset} pero solo tenemos {existing_size}.") 
+                         self.log_callback("Abortando conexión por desincronización de offsets.")
+                         conn.close()
+                         return
+                 else:
+                     # Sender envía offset > 0 pero no tenemos archivo. Imposible.
+                     self.log_callback(f"Error: Sender envía offset {sender_offset} pero no existe archivo local.")
+                     conn.close()
+                     return
             else:
+                 # Offset 0, descarga limpia
                  if existing_size > 0:
-                     self.log_callback(f"Iniciando descarga limpia de {filename} (Sobrescribiendo local)")
+                     self.log_callback(f"Iniciando descarga limpia de {filename} (Sobrescribiendo local, Sender Offset 0)")
                  mode = 'wb' # Overwrite
                  received_bytes = 0
             
