@@ -200,22 +200,60 @@ class FileTransferHandler:
         # Evitar re-procesar archivos que acabamos de recibir
         self.recently_received = set() 
         self.active_downloads = set() # Track active downloads (filename, peer_ip) 
+        self.active_uploads = set() # Track active uploads (filename, peer_ip)
+        self.incoming_queue = [] # Queue for incoming transfers when busy sending
+        self.queue_lock = threading.Lock()
+        
+        # Start queue processor
+        threading.Thread(target=self._process_queue, daemon=True).start()
 
     def start_server(self):
         self.running = True
         threading.Thread(target=self._accept_connections, daemon=True).start()
 
+
     def _accept_connections(self):
-        """Acepta conexiones entrantes para recibir archivos."""
+        """Acepta conexiones entrantes."""
         while self.running:
             try:
                 client_sock, addr = self.server_socket.accept()
-                threading.Thread(target=self._handle_incoming_file, args=(client_sock,), daemon=True).start()
+                
+                # Check if we are busy sending
+                busy_sending = bool(self.active_uploads)
+                
+                if busy_sending:
+                     self.log_callback(f"Encolando conexión entrante de {addr[0]} (Enviando actualmente)")
+                     with self.queue_lock:
+                         self.incoming_queue.append(client_sock)
+                else:
+                     threading.Thread(target=self._handle_incoming_file, args=(client_sock,), daemon=True).start()
+                     
             except socket.timeout:
                 continue
             except Exception as e:
                 if self.running:
                     self.log_callback(f"Error aceptando conexión: {e}")
+
+    def _process_queue(self):
+        """Procesa la cola de descargas pendientes cuando no se está enviando."""
+        while self.running:
+            time.sleep(1)
+            # Only process if uploads are clear
+            can_process = not self.active_uploads
+            
+            conn_to_process = None
+            if can_process:
+                with self.queue_lock:
+                    if self.incoming_queue:
+                         conn_to_process = self.incoming_queue.pop(0)
+            
+            if conn_to_process:
+                 try:
+                    peer_ip = conn_to_process.getpeername()[0]
+                    self.log_callback(f"Procesando descarga encolada de {peer_ip}")
+                    threading.Thread(target=self._handle_incoming_file, args=(conn_to_process,), daemon=True).start()
+                 except Exception as e:
+                    self.log_callback(f"Advertencia: Error procesando item de cola: {e}") 
 
     def _handle_incoming_file(self, conn):
         """Procesa la recepción de un archivo."""
@@ -265,8 +303,25 @@ class FileTransferHandler:
             is_protected = header.get('is_protected', False)
             password = header.get('password', None)
             
-            # Avoid duplicate downloads
             peer_ip = conn.getpeername()[0]
+            
+            # CRITICAL FIX: If we are sending THIS file to ANYONE, refuse receiving it back.
+            # This prevents loopback of incomplete files.
+            # Also check if we are sending ANY file to THIS peer? No, that's fine (full duplex).
+            # But "sender starts receiving the incomplete file" means we are receiving back what we sent.
+            
+            is_being_uploaded = False
+            for (up_filename, up_peer) in self.active_uploads:
+                if up_filename == filename:
+                    is_being_uploaded = True
+                    break
+            
+            if is_being_uploaded:
+                self.log_callback(f"Rechazado: {filename} desde {peer_ip} (Actualmente se está enviando este archivo)")
+                conn.close()
+                return
+
+            # Avoid duplicate downloads
             # Since request_resume adds to active_downloads to prevent new requests,
             # we simply allow the connection if it's there.
             # We add it if it's not.
@@ -461,6 +516,10 @@ class FileTransferHandler:
 
         try:
             print(f"DEBUG: Intentando conectar a {ip} para enviar {filename} (Protegido: {is_protected}, Offset: {offset})")
+            
+            # Registrar upload activo
+            self.active_uploads.add((filename, ip))
+            
             file_size = os.path.getsize(filepath)
             file_hash = Utils.calculate_file_hash(filepath)
             
@@ -498,14 +557,19 @@ class FileTransferHandler:
                     s.sendall(chunk)
                     sent_bytes += len(chunk)
                     if self.progress_callback and file_size > 0:
-                        self.progress_callback(filename, sent_bytes, file_size)
+                        self.progress_callback(filename, sent_bytes, file_size, ip)
             
             self.log_callback(f"Enviado: {filename} a {ip} (Completado)")
+            if self.progress_callback:
+                self.progress_callback(filename, sent_bytes, file_size, ip, completed=True)
             s.close()
         except ConnectionRefusedError:
              self.log_callback(f"Fallo conexión con {ip}")
         except Exception as e:
              self.log_callback(f"Error enviando {filename} a {ip}: {e}")
+        finally:
+             if (filename, ip) in self.active_uploads:
+                 self.active_uploads.remove((filename, ip))
 
     def request_resume(self, ip, filename, offset, is_protected, password=None):
         """Solicita reanudación de descarga a un sender"""
@@ -720,7 +784,8 @@ class P2PApp:
         self.btn_open_protected.pack(pady=5)
 
         self.btn_share_file = tk.Button(root, text="Seleccionar Archivo para Compartir", command=self.share_file_manual)
-        self.btn_share_file.pack(pady=5)
+        # Progress bar management
+        self.active_transfers = {} # {(filename, ip): percent}
 
         # Lógica de Negocio
         self.transfer_handler = FileTransferHandler(self.log_message, self.password, self.update_progress)
@@ -744,16 +809,42 @@ class P2PApp:
         
         self.log_message("Sistema iniciado. Esperando peers...")
 
-    def update_progress(self, filename, sent, total):
+    def update_progress(self, filename, sent, total, peer_ip=None, completed=False):
         """Callback para actualizar barra de progreso desde el hilo de envío"""
-        def _update():
+        # Calcular porcentaje
+        percent = 0.0
+        if total > 0:
             percent = (sent / total) * 100
-            self.progress_val.set(percent)
-            self.lbl_progress.config(text=f"Enviando {filename}: {int(percent)}%")
-            if sent >= total:
-                self.root.after(2000, lambda: self.lbl_progress.config(text="")) # Limpiar mensaje despues de 2s
-                self.root.after(2000, lambda: self.progress_val.set(0)) # Reset barra
-        self.root.after(0, _update)
+            
+        # Pasar valores a método UI usando argumentos directos de after
+        # Esto evita problemas de closure con lambdas
+        self.root.after(0, self._update_ui_state, filename, peer_ip, percent, completed)
+
+    def _update_ui_state(self, filename, peer_ip, percent, completed):
+        key = (filename, peer_ip)
+        
+        if completed:
+            if key in self.active_transfers:
+                del self.active_transfers[key]
+        else:
+            self.active_transfers[key] = percent
+            
+        if not self.active_transfers:
+             self.lbl_progress.config(text="")
+             self.progress_val.set(0)
+             return
+
+        # Calcular promedio
+        vals = list(self.active_transfers.values())
+        avg = sum(vals) / len(vals)
+        self.progress_val.set(avg)
+        
+        if len(self.active_transfers) == 1:
+             fname, pip = list(self.active_transfers.keys())[0]
+             val = self.active_transfers[(fname, pip)]
+             self.lbl_progress.config(text=f"Enviando {fname} a {pip}: {int(val)}%")
+        else:
+             self.lbl_progress.config(text=f"Enviando {len(self.active_transfers)} archivos... (Avg: {int(avg)}%)")
 
     def log_message(self, msg):
         """Agrega mensajes al área de texto de manera thread-safe."""
