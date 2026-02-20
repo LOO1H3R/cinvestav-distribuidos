@@ -784,6 +784,8 @@ class P2PApp:
         self.btn_open_protected.pack(pady=5)
 
         self.btn_share_file = tk.Button(root, text="Seleccionar Archivo para Compartir", command=self.share_file_manual)
+        self.btn_share_file.pack(pady=5)
+        
         # Progress bar management
         self.active_transfers = {} # {(filename, ip): percent}
 
